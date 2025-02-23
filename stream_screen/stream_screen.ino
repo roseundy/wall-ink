@@ -1,14 +1,15 @@
-//Sketch uses esp8266 board version 2.4.2
+//Sketch uses esp32c3 board version 1.0
 //Sketch uses the GxEPD library from https://github.com/ZinggJM/GxEPD
-//The GxEPD library needs to be modified such that display._buffer is public instead of private. This needs to be done for the driver of each screen type you want to support.
 //You may notice that this program has a few memory leaks. Those were left there on purpose, since the device reboots so often.
 
-#include <GxEPD.h>
-#include <Hash.h>
+#include <GxEPD2_BW.h>
+#include <Crypto.h>
+#include "SHA1.h"
 #include "debug_mode.h"
 #include "credentials.h"
-#include <pgmspace.h>
-#define FIRMWARE_VERSION "4.02a"
+#include <Fonts/FreeMonoBold9pt7b.h>
+
+#define FIRMWARE_VERSION "1.0"
 #define BASE_URL "http://example.com/get_image.php"
 #define DEVICE_TYPE 2
 #define ADMIN_MODE_ENABLED 1
@@ -17,46 +18,34 @@
 #define ONE_DAY 86400
 #define ONE_HOUR 3600
 #define INITIAL_DRIFT_SECONDS 30
-#define DEBUG_ON_BY_DEFAULT false
+#define DEBUG_ON_BY_DEFAULT true
 #define WIFI_PROFILE_1_ACTIVE_BY_DEFAULT true
+#define AP_MAC_PREFIX "FUUC eP "
 
-extern "C" {
-#include "user_interface.h"
-}
+#define EPAPER_CS_PIN 7
+#define EPAPER_DC_PIN 10
+#define EPAPER_RST_PIN 1
+#define EPAPER_BUSY_PIN 0
 
-#if DEVICE_TYPE == 1
-#define X_RES 400
-#define Y_RES 300
-#define ROTATION 0
-#include <GxGDEW042T2/GxGDEW042T2.cpp>      // 4.2" b/w landscape
-#elif DEVICE_TYPE == 2
-#define X_RES 640
-#define Y_RES 384
+#define CONFIG_PIN 5
+
+// WaveShare 7.5" B/W Version 2
+#define X_RES 800
+#define Y_RES 480
 #define ROTATION 2
-#include <GxGDEW075T8/GxGDEW075T8.cpp>      // 7.5" b/w landscape
-#endif
+GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT> display(GxEPD2_750_T7(EPAPER_CS_PIN, EPAPER_DC_PIN, EPAPER_RST_PIN, EPAPER_BUSY_PIN)); // GDEW075T7 800x480, EK79655 (GD7965)
 
 #include "admin_mode.h"
 
-#include <GxIO/GxIO_SPI/GxIO_SPI.cpp>
-#include <GxIO/GxIO.cpp>
-
-#include <Fonts/FreeMonoBold9pt7b.h>
-
-GxIO_Class io(SPI, 5, 0, 2);
-GxEPD_Class display(io, 2, 12);
-
-#include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
-#include <ESP8266HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <HTTPClient.h>
 #include <EEPROM.h>
-#include <ESP8266WebServer.h>
+#include <WebServer.h>
+#include "esp_mac.h"
 
-ADC_MODE(ADC_VCC);  //needed to read the supply voltage
-
-ESP8266WiFiMulti WiFiMulti;
-
-ESP8266WebServer server(80);
+WiFiMulti WiFiMulti;
+WebServer server(80);
 
 // CRC function used to ensure data validity
 uint32_t calculateCRC32(const uint8_t *data, size_t length);
@@ -69,7 +58,7 @@ uint16_t attempts = 0;
 // rest of structure contents.
 // Any fields can go after CRC32.
 // Must use a multiple of 4 bytes of RAM.
-struct {
+struct rtc_struct {
     uint32_t crc32;
     uint32_t currentTime;
     uint32_t nextTime;
@@ -83,7 +72,9 @@ struct {
     char password[20];
     char imageHash[20];
     uint32_t errorCode;
-} rtcData;
+};
+
+RTC_DATA_ATTR struct rtc_struct rtcData;
 
 struct {
     bool wifiProfile1Active;
@@ -97,6 +88,12 @@ struct {
     uint8_t hash[20];
 } eeprom;
 
+// SHA1 hashes
+mySHA1 image_sha;
+mySHA1 sha;
+mySHA1 final_sha;
+mySHA1 everything_sha;
+
 String url = "";
 
 bool readEeprom() {
@@ -104,7 +101,10 @@ bool readEeprom() {
     EEPROM.get(0, eeprom);
     EEPROM.end();
     uint8_t hash[20];
-    sha1((uint8_t*) &eeprom, sizeof(eeprom)-20, hash);
+    sha.reset();
+    sha.update(&eeprom, sizeof(eeprom)-20);
+    sha.finalize(hash, 20);
+    //sha1((uint8_t*) &eeprom, sizeof(eeprom)-20, hash);
     bool dataCorrupted = false;
     for (int i = 0; i < 20; i++) {
         if (eeprom.hash[i] != hash[i]) {
@@ -115,17 +115,28 @@ bool readEeprom() {
 }
 
 void writeEeprom() {
-    sha1((uint8_t*) &eeprom, sizeof(eeprom)-20, eeprom.hash);
+    sha.reset();
+    sha.update(&eeprom, sizeof(eeprom)-20);
+    sha.finalize(eeprom.hash, 20);
+    //sha1((uint8_t*) &eeprom, sizeof(eeprom)-20, eeprom.hash);
     EEPROM.begin(sizeof(eeprom));
     EEPROM.put(0, eeprom);
     EEPROM.end();
 }
 
 String getMAC() {
-    String mac = WiFi.macAddress();
-    while(mac.indexOf(':') != -1) {
-        mac.remove(mac.indexOf(':'), 1);
+    uint8_t baseMac[6];
+    esp_efuse_mac_get_default(baseMac);
+    String mac = "";
+    char hex[3];
+    for (int i=0; i<6; i++) {
+      sprintf(hex, "%2.2x", baseMac[i]);
+      mac += String(hex);
     }
+    //String mac = WiFi.macAddress();
+    //while(mac.indexOf(':') != -1) {
+    //    mac.remove(mac.indexOf(':'), 1);
+    //}
     return mac;
 }
 
@@ -151,7 +162,7 @@ void setURL() {
         Serial.println(ESP.getCycleCount() / 80000);
     }
     float volts = 0.00f;
-    volts = ESP.getVcc();
+    volts = analogRead(2);
     url += String(volts/1024.00f);
     if (eeprom.debug) {
         Serial.print("Voltage: ");
@@ -216,7 +227,7 @@ void crash(String reason) {
         Serial.println(WiFi.SSID());
 
         Serial.print("Free heap:");
-        Serial.println(system_get_free_heap_size());
+        Serial.println(ESP.getFreeHeap());
 
         Serial.print("Router MAC Address:");
         Serial.println(WiFi.BSSIDstr());
@@ -231,7 +242,7 @@ void crash(String reason) {
         Serial.println(WiFi.RSSI());
 
         Serial.print("MAC Address:");
-        Serial.println(WiFi.macAddress());
+        Serial.println(getMAC());
 
         Serial.print("URL:");
         setURL();
@@ -261,14 +272,15 @@ void crash(String reason) {
     rtcData.crc32 = calculateCRC32(((uint8_t*) &rtcData) + 4, sizeof(rtcData) - 4);
 
     // Write struct to RTC memory; this if statement has important side-effects; do not remove it!
-    if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
-        //Serial.println("Write: ");
-        //printMemory();
-        //Serial.println();
-    }
+    //if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
+    //    //Serial.println("Write: ");
+    //    //printMemory();
+    //    //Serial.println();
+    //}
 
-    ESP.deepSleep(sleepTime * 1000000);
-
+    //ESP.deepSleep(sleepTime * 1000000);
+    esp_sleep_enable_timer_wakeup(sleepTime * 1000000);
+    esp_deep_sleep_start();
 }
 
 void sleep() {
@@ -281,8 +293,8 @@ void sleep() {
     // Update CRC32 of data
     rtcData.crc32 = calculateCRC32(((uint8_t*) &rtcData) + 4, sizeof(rtcData) - 4);
     // Write struct to RTC memory
-    if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
-    }
+    //if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
+    //}
 
     if (eeprom.debug) {
         Serial.print("currentTime: ");
@@ -303,7 +315,9 @@ void sleep() {
             Serial.print("Drift seconds: ");
             Serial.println(rtcData.driftSeconds);
         }
-        ESP.deepSleep(MIN_SLEEP * 1000000);
+        //ESP.deepSleep(MIN_SLEEP * 1000000);
+        esp_sleep_enable_timer_wakeup(MIN_SLEEP * 1000000);
+        esp_deep_sleep_start();
     }
     if (eeprom.debug) {
         Serial.print("sleepTime: ");
@@ -315,7 +329,9 @@ void sleep() {
         Serial.println(ESP.getCycleCount() / 80000);
         Serial.println("");
     }
-    ESP.deepSleep((sleepTime + rtcData.driftSeconds) * 1000000);
+    //ESP.deepSleep((sleepTime + rtcData.driftSeconds) * 1000000);
+    esp_sleep_enable_timer_wakeup((sleepTime + rtcData.driftSeconds) * 1000000);
+    esp_deep_sleep_start();
 }
 
 void dumpToScreen(String reason, uint32_t sleepTime) {
@@ -345,7 +361,7 @@ void dumpToScreen(String reason, uint32_t sleepTime) {
     display.println(WiFi.RSSI());
 
     display.print("MAC Address:");
-    display.println(WiFi.macAddress());
+    display.println(getMAC());
 
     display.print("URL:");
     setURL();
@@ -364,7 +380,8 @@ void dumpToScreen(String reason, uint32_t sleepTime) {
     display.print(sleepTime);
     display.println(" seconds");
 
-    display.update();
+    //display.update();
+    display.nextPage();
     for (int i = 0; i < 20; i++)
         rtcData.imageHash[i] = -1;
 }
@@ -438,21 +455,44 @@ void activateAdminMode() {
     // Write bad crc32 so that a new image is refreshed on reboot
     rtcData.crc32 = calculateCRC32(((uint8_t*) &rtcData), sizeof(rtcData));
     // Write struct with bad crc32 to RTC memory
-    if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
-    }
+    //if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
+    //}
 
     if (eeprom.debug) {
         Serial.println();
         Serial.print("Configuring access point...\n");
     }
-    display.init();
-    memcpy_P(display._buffer, admin_image, sizeof(display._buffer));
-    display.update();
+    display.init(115200);
+    display.setRotation(2);
+    display.setFullWindow();
+    display.firstPage();
+    display.fillScreen(GxEPD_WHITE);
+
+    //memcpy_P(display._buffer, admin_image, sizeof(display._buffer)); // FIXME!
+    unsigned char eightPixels;
+    int cursor = 0;
+    for (int offset=0; offset<(480*800/8); offset++) {
+        eightPixels = admin_image[offset];
+        for (uint8_t i = 0; i < 8; i++) {
+            if ((eightPixels >> (7-i)) & 0x01)
+              display.drawPixel((cursor+i)%800, (cursor+i)/800, GxEPD_BLACK);
+        }
+        cursor += 8;
+    }
+    if (eeprom.debug) {
+        Serial.println();
+        Serial.println("Copied image\n");
+    }
+    
+    display.nextPage();
     WiFi.mode(WIFI_AP);
     IPAddress apIP(192, 168, 4, 1);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    String ssid = "BYU DD ";
+    String ssid = AP_MAC_PREFIX;
     ssid += getMAC();
+    if (eeprom.debug) {
+      Serial.printf("MAC: %s\n", ssid.c_str());
+    }
     WiFi.softAP(ssid.c_str(), ADMIN_PASSWORD);
 
     IPAddress myIP = WiFi.softAPIP();
@@ -481,122 +521,115 @@ void eepromSetDefault() {
 }
 
 void readRTC() {
-    if (ESP.rtcUserMemoryRead(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
-        if (eeprom.debug) {
-            //Serial.println("Read: ");
-            //printMemory();
-            //Serial.println();
-        }
-        uint32_t crcOfData = calculateCRC32(((uint8_t*) &rtcData) + 4, sizeof(rtcData) - 4);
-        if (eeprom.debug) {
-            Serial.print("CRC32 of data: ");
-            Serial.println(crcOfData, HEX);
-            Serial.print("CRC32 read from RTC: ");
-            Serial.println(rtcData.crc32, HEX);
-        }
-        if (crcOfData != rtcData.crc32) {
-            if (eeprom.debug) {
-                Serial.println("CRC32 in RTC memory doesn't match CRC32 of data. Data is probably invalid!");
-                Serial.println("Connecting to wifi with default settings");
-                Serial.print("Time in milliseconds: ");
-                Serial.println(ESP.getCycleCount() / 80000);
-            }
-            WiFi.mode(WIFI_STA);
-            WiFiMulti.addAP(eeprom.ssid0, eeprom.password0);
-            WiFiMulti.addAP(eeprom.ssid1, eeprom.password1);
-            while(WiFiMulti.run() != WL_CONNECTED) {
-                Serial.print(".");
-                delay(500);
-                if (WiFi.status() == WL_CONNECT_FAILED) {
-                    rtcData.errorCode = 4;
-                    crash("WiFi connection failed");
-                } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
-                    rtcData.errorCode = 5;
-                    crash("SSID not available");
-                } else if (WiFi.status() == WL_CONNECTION_LOST) {
-                    rtcData.errorCode = 6;
-                    crash("WiFi connection lost");
-                }
-                attempts++;
-                if (attempts == 15) {
-                    //WiFi.disconnect();
-                    delay(1);
-                    //WiFiMulti.addAP(WIFI_SSID0, WIFI_PASSWORD0);
-                    //WiFiMulti.addAP(WIFI_SSID1, WIFI_PASSWORD1);
-                    //WiFiMulti.run();
-                } else if (attempts > 40) {
-                    rtcData.errorCode = 7;
-                    crash("Error connecting to WiFi");
-                }
-                delay(500);
-                if (eeprom.debug) {
-                    String a = "Attempt " + String(attempts);
-                    Serial.println(a);
-                }
-            }
-            rtcData.currentTime = 0;
-            rtcData.nextTime = 0;
-            rtcData.elapsedTime = 0;
-            rtcData.errorCode = 0;
-            for (int i = 0; i < 20; i++)
-                rtcData.imageHash[i] = 0;
-            rtcData.driftSeconds = INITIAL_DRIFT_SECONDS;
-            rtcData.consecutiveCrashes = 0;
-        } else {
-            //if we aren't there yet, sleep
-            if (rtcData.elapsedTime + rtcData.currentTime < rtcData.nextTime) {
-                sleep();
-            }
-            randomSeed(ESP.getCycleCount());
-            if (random(30) == 1 || rtcData.consecutiveCrashes != 0) {
-                WiFiMulti.addAP(eeprom.ssid0, eeprom.password0);
-                WiFiMulti.addAP(eeprom.ssid1, eeprom.password1);
-                if (eeprom.debug) {
-                    Serial.println("Connecting to wifi with default settings");
-                    Serial.print("Time in milliseconds: ");
-                    Serial.println(ESP.getCycleCount() / 80000);
-                }
-                WiFi.mode(WIFI_STA);
-                while(WiFiMulti.run() != WL_CONNECTED) {
-                    Serial.print(".");
-                    delay(500);
-                    if (WiFi.status() == WL_CONNECT_FAILED) {
-                        rtcData.errorCode = 4;
-                        crash("WiFi connection failed");
-                    } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
-                        rtcData.errorCode = 5;
-                        crash("SSID not available");
-                    } else if (WiFi.status() == WL_CONNECTION_LOST) {
-                        rtcData.errorCode = 6;
-                        crash("WiFi connection lost");
-                    }
-                    attempts++;
-                    if (attempts == 15) {
-                        //WiFi.disconnect();
-                        delay(1);
-                        //WiFiMulti.addAP(WIFI_SSID0, WIFI_PASSWORD0);
-                        //WiFiMulti.addAP(WIFI_SSID1, WIFI_PASSWORD1);
-                        //WiFiMulti.run();
-                    } else if (attempts > 40) {
-                        rtcData.errorCode = 7;
-                        crash("Error connecting to WiFi");
-                    }
-                    delay(500);
-                    if (eeprom.debug) {
-                        String a = "Attempt " + String(attempts);
-                        Serial.println(a);
-                    }
-                }
-            } else {
-                WiFi.begin(rtcData.ssid, rtcData.password, rtcData.channel, rtcData.bssid);
-                if (eeprom.debug) {
-                    Serial.println("Connecting to wifi with stored settings");
-                    Serial.print("Time in milliseconds: ");
-                    Serial.println(ESP.getCycleCount() / 80000);
-                }
-            }
-        }
+  uint32_t crcOfData = calculateCRC32(((uint8_t*)&rtcData) + 4, sizeof(rtcData) - 4);
+  if (eeprom.debug) {
+    Serial.print("CRC32 of data: ");
+    Serial.println(crcOfData, HEX);
+    Serial.print("CRC32 read from RTC: ");
+    Serial.println(rtcData.crc32, HEX);
+  }
+  if (crcOfData != rtcData.crc32) {
+    if (eeprom.debug) {
+      Serial.println("CRC32 in RTC memory doesn't match CRC32 of data. Data is probably invalid!");
+      Serial.println("Connecting to wifi with default settings");
+      Serial.print("Time in milliseconds: ");
+      Serial.println(ESP.getCycleCount() / 80000);
     }
+    WiFi.mode(WIFI_STA);
+    WiFiMulti.addAP(eeprom.ssid0, eeprom.password0);
+    WiFiMulti.addAP(eeprom.ssid1, eeprom.password1);
+    while (WiFiMulti.run() != WL_CONNECTED) {
+      Serial.print(".");
+      delay(500);
+      if (WiFi.status() == WL_CONNECT_FAILED) {
+        rtcData.errorCode = 4;
+        crash("WiFi connection failed");
+      } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
+        rtcData.errorCode = 5;
+        crash("SSID not available");
+      } else if (WiFi.status() == WL_CONNECTION_LOST) {
+        rtcData.errorCode = 6;
+        crash("WiFi connection lost");
+      }
+      attempts++;
+      if (attempts == 15) {
+        //WiFi.disconnect();
+        delay(1);
+        //WiFiMulti.addAP(WIFI_SSID0, WIFI_PASSWORD0);
+        //WiFiMulti.addAP(WIFI_SSID1, WIFI_PASSWORD1);
+        //WiFiMulti.run();
+      } else if (attempts > 40) {
+        rtcData.errorCode = 7;
+        crash("Error connecting to WiFi");
+      }
+      delay(500);
+      if (eeprom.debug) {
+        String a = "Attempt " + String(attempts);
+        Serial.println(a);
+      }
+    }
+    rtcData.currentTime = 0;
+    rtcData.nextTime = 0;
+    rtcData.elapsedTime = 0;
+    rtcData.errorCode = 0;
+    for (int i = 0; i < 20; i++)
+      rtcData.imageHash[i] = 0;
+    rtcData.driftSeconds = INITIAL_DRIFT_SECONDS;
+    rtcData.consecutiveCrashes = 0;
+  } else {
+    //if we aren't there yet, sleep
+    if (rtcData.elapsedTime + rtcData.currentTime < rtcData.nextTime) {
+      sleep();
+    }
+    randomSeed(ESP.getCycleCount());
+    if (random(30) == 1 || rtcData.consecutiveCrashes != 0) {
+      WiFiMulti.addAP(eeprom.ssid0, eeprom.password0);
+      WiFiMulti.addAP(eeprom.ssid1, eeprom.password1);
+      if (eeprom.debug) {
+        Serial.println("Connecting to wifi with default settings");
+        Serial.print("Time in milliseconds: ");
+        Serial.println(ESP.getCycleCount() / 80000);
+      }
+      WiFi.mode(WIFI_STA);
+      while (WiFiMulti.run() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(500);
+        if (WiFi.status() == WL_CONNECT_FAILED) {
+          rtcData.errorCode = 4;
+          crash("WiFi connection failed");
+        } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
+          rtcData.errorCode = 5;
+          crash("SSID not available");
+        } else if (WiFi.status() == WL_CONNECTION_LOST) {
+          rtcData.errorCode = 6;
+          crash("WiFi connection lost");
+        }
+        attempts++;
+        if (attempts == 15) {
+          //WiFi.disconnect();
+          delay(1);
+          //WiFiMulti.addAP(WIFI_SSID0, WIFI_PASSWORD0);
+          //WiFiMulti.addAP(WIFI_SSID1, WIFI_PASSWORD1);
+          //WiFiMulti.run();
+        } else if (attempts > 40) {
+          rtcData.errorCode = 7;
+          crash("Error connecting to WiFi");
+        }
+        delay(500);
+        if (eeprom.debug) {
+          String a = "Attempt " + String(attempts);
+          Serial.println(a);
+        }
+      }
+    } else {
+      WiFi.begin(rtcData.ssid, rtcData.password, rtcData.channel, rtcData.bssid);
+      if (eeprom.debug) {
+        Serial.println("Connecting to wifi with stored settings");
+        Serial.print("Time in milliseconds: ");
+        Serial.println(ESP.getCycleCount() / 80000);
+      }
+    }
+  }
 }
 
 void setup() {
@@ -626,8 +659,8 @@ void setup() {
 
 #if ADMIN_MODE_ENABLED == 1
     //activate AP mode if set to do so
-    pinMode(4, INPUT_PULLUP);
-    if (digitalRead(4) == LOW) {
+    pinMode(CONFIG_PIN, INPUT_PULLUP);
+    if (digitalRead(CONFIG_PIN) == LOW) {
         activateAdminMode();
     } else {
         WiFi.mode(WIFI_STA);
@@ -719,7 +752,7 @@ void loop() {
                 rtcData.errorCode = 2;
                 crash("File too small or not found");
                 if (eeprom.debug) {
-                    system_get_free_heap_size();
+                    ESP.getFreeHeap();
                 }
             }
 
@@ -734,6 +767,9 @@ void loop() {
             //the server does the same thing, and the client compares the results.
             uint8_t* hash = (uint8_t*) malloc(80);
             uint8_t* serverEverythingHash = (uint8_t*) malloc(20);
+
+
+            image_sha.reset();
 
             // read all data from server
             while(http.connected() && (len > 0 || len == -1)) {
@@ -750,17 +786,29 @@ void loop() {
 
                             //sha1( sha1(chunk 2 . chunk 3) . sha1(mac_address) . sha1(image_key) )
                             //the server does the same thing, and the client compares them
-                            sha1(buff + 20, 8, hash);
+
+                            sha.reset();
+                            sha.update(buff + 20, 8);
+                            sha.finalize(hash, 20);
+                            //sha1(buff + 20, 8, hash);
                             char* mac_char_array = (char*) malloc(20);
-                            String mac = WiFi.macAddress();
-                            while (mac.indexOf(':') != -1) {
-                                mac.remove(mac.indexOf(':'), 1);
-                            }
+                            String mac = getMAC();
                             mac.toCharArray(mac_char_array, 13);
-                            sha1(mac_char_array, strlen(mac_char_array), hash+20);
-                            sha1(eeprom.imageKey, strlen(eeprom.imageKey), hash+40);
+                            sha.reset();
+                            sha.update(mac_char_array, strlen(mac_char_array));
+                            sha.finalize(hash + 20, 20);
+                            //sha1(mac_char_array, strlen(mac_char_array), hash+20);
+                            
+                            sha.reset();
+                            sha.update(eeprom.imageKey, strlen(eeprom.imageKey));
+                            sha.finalize(hash + 40, 20);
+                            //sha1(eeprom.imageKey, strlen(eeprom.imageKey), hash+40);
+                            
                             uint8_t* finalTimeHash = (uint8_t*) malloc(20);
-                            sha1(hash, 60, finalTimeHash);
+                            sha.reset();
+                            sha.update(hash, 60);
+                            sha.finalize(finalTimeHash, 20);
+                            //sha1(hash, 60, finalTimeHash);
                             if (eeprom.debug) {
                                 Serial.println("remote timeHash: ");
                                 for (int i = 0; i < 20; i++) {
@@ -787,7 +835,7 @@ void loop() {
                                 }
                                 WiFi.disconnect();
                                 delay(10);
-                                WiFi.forceSleepBegin();
+                                WiFi.mode(WIFI_OFF);
                                 delay(10);
                                 rtcData.errorCode = 3;
                                 crash("Time data or password failed verification test");
@@ -835,7 +883,7 @@ void loop() {
                             if (imageMatch && rtcData.consecutiveCrashes == 0) {
                                 WiFi.disconnect();
                                 delay(10);
-                                WiFi.forceSleepBegin();
+                                WiFi.mode(WIFI_OFF);
                                 delay(10);
                                 sleep();
                             }
@@ -852,6 +900,12 @@ void loop() {
                             memcpy(serverEverythingHash, buff+48, 20);
                             rtcData.consecutiveCrashes = 0;
                             offset += 68;
+
+                            // hash last part of first transfer (first part of image)
+                            image_sha.update(buff+68, c-68);
+                        } else {
+                            // hash all of subsequent transfers (rest of image)
+                            image_sha.update(buff, c);
                         }
                         eightPixels = buff[offset];
                         if (cursor < X_RES*Y_RES) {
@@ -870,7 +924,7 @@ void loop() {
             }
             WiFi.disconnect();
             delay(10);
-            WiFi.forceSleepBegin();
+            WiFi.mode(WIFI_OFF);
             delay(10);
             if (eeprom.debug) {
                 Serial.println("Calculating SHA1 hash");
@@ -882,9 +936,15 @@ void loop() {
             //move image key hash to the end
             memcpy(hash+60, hash+40, 20);
             //hash the image
-            sha1(display._buffer, X_RES*Y_RES/8, hash+40);
+            image_sha.finalize(hash+40, 20);
+            //sha1(display._buffer, X_RES*Y_RES/8, hash+40);
+
             uint8_t* finalImageHash = (uint8_t*) malloc(20);
-            sha1(hash+20, 60, finalImageHash);
+
+            final_sha.reset();
+            final_sha.update(hash+20, 60);
+            final_sha.finalize(finalImageHash, 20);
+            //sha1(hash+20, 60, finalImageHash);
             if (eeprom.debug) {
                 Serial.println("local image hash: ");
                 for (int i = 0; i < 20; i++) {
@@ -903,7 +963,11 @@ void loop() {
             //the server does the same thing, and the client compares them
             //this is used to defend against certain types of replay attacks
             uint8_t* finalEverythingHash = (uint8_t*) malloc(20);
-            sha1(hash, 80, finalEverythingHash);
+
+            everything_sha.reset();
+            everything_sha.update(hash, 80);
+            everything_sha.finalize(finalEverythingHash, 20);
+            //sha1(hash, 80, finalEverythingHash);
             if (eeprom.debug) {
                 Serial.println("local hash with everything: ");
                 for (int i = 0; i < 20; i++) {
@@ -925,7 +989,7 @@ void loop() {
                 }
                 WiFi.disconnect();
                 delay(10);
-                WiFi.forceSleepBegin();
+                WiFi.mode(WIFI_OFF);
                 delay(10);
                 rtcData.errorCode = 3;
                 crash("Image failed verification test");
@@ -936,9 +1000,19 @@ void loop() {
                 Serial.println("Updating display");
                 Serial.print("Time in milliseconds: ");
                 Serial.println(ESP.getCycleCount() / 80000);
-                memcpy_P(display._buffer, debug_image, 1120);
+                //memcpy_P(display._buffer, debug_image, 1120); // FIXME
+                unsigned char eightPixels;
+                int cursor = 0;
+                for (int offset = 0; offset < (14*640/8); offset++) {
+                  eightPixels = debug_image[offset];
+                  for (uint8_t i = 0; i < 8; i++) {
+                    if ((eightPixels >> (7 - i)) & 0x01)
+                      display.drawPixel((cursor + i) % 640, (cursor + i) / 640, GxEPD_BLACK);
+                  }
+                  cursor += 8;
+                }
             }
-            display.update();
+            display.nextPage();
             rtcData.errorCode = 0;
             if (eeprom.debug) {
                 Serial.println("Display updated, sleeping");
