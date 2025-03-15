@@ -28,6 +28,8 @@
 #define EPAPER_BUSY_PIN 0
 
 #define CONFIG_PIN 5
+#define SENSE_PIN 3
+#define PWR_PIN 19
 
 // WaveShare 7.5" B/W Version 2
 #define X_RES 800
@@ -130,7 +132,7 @@ String getMAC() {
     String mac = "";
     char hex[3];
     for (int i=0; i<6; i++) {
-      sprintf(hex, "%2.2x", baseMac[i]);
+      sprintf(hex, "%2.2X", baseMac[i]);
       mac += String(hex);
     }
     //String mac = WiFi.macAddress();
@@ -162,11 +164,11 @@ void setURL() {
         Serial.println(ESP.getCycleCount() / 80000);
     }
     float volts = 0.00f;
-    volts = analogRead(2);
-    url += String(volts/1024.00f);
+    volts = analogRead(SENSE_PIN);
+    url += String(volts/620.6f);
     if (eeprom.debug) {
         Serial.print("Voltage: ");
-        Serial.println(volts/1024.00f);
+        Serial.println(volts/620.6f);
         Serial.print("Time in milliseconds: ");
         Serial.println(ESP.getCycleCount() / 80000);
     }
@@ -217,6 +219,9 @@ void crash(String reason) {
     if (rtcData.consecutiveCrashes > 3 || eeprom.debug) {
         dumpToScreen(reason, sleepTime);
     }
+
+    // Kill power to screen
+    digitalWrite(PWR_PIN, 0);
 
     rtcData.nextTime += sleepTime;
 
@@ -284,6 +289,9 @@ void crash(String reason) {
 }
 
 void sleep() {
+     // Kill power to screen
+    digitalWrite(PWR_PIN, 0);
+
     uint32_t sleepTime = rtcData.nextTime - rtcData.currentTime - rtcData.elapsedTime;
     if (sleepTime > MAX_SLEEP) {
         sleepTime = MAX_SLEEP;
@@ -634,6 +642,10 @@ void readRTC() {
 
 void setup() {
 
+    // start powering up display
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, 1);
+
     //if EEPROM data is bad, regenerate it
     if (!readEeprom()) {
         eepromSetDefault();
@@ -770,6 +782,7 @@ void loop() {
 
 
             image_sha.reset();
+            int image_bytes = 0;
 
             // read all data from server
             while(http.connected() && (len > 0 || len == -1)) {
@@ -777,6 +790,7 @@ void loop() {
                 size_t size = stream->available();
 
                 if(size) {
+                    bool skip_image_hash = false;
                     // read up to 128 byte
                     int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
                     for (int offset = 0; offset < c; offset++) {
@@ -791,13 +805,26 @@ void loop() {
                             sha.update(buff + 20, 8);
                             sha.finalize(hash, 20);
                             //sha1(buff + 20, 8, hash);
-                            char* mac_char_array = (char*) malloc(20);
+                            char* mac_char_array = (char*) malloc(21);
                             String mac = getMAC();
                             mac.toCharArray(mac_char_array, 13);
                             sha.reset();
                             sha.update(mac_char_array, strlen(mac_char_array));
                             sha.finalize(hash + 20, 20);
                             //sha1(mac_char_array, strlen(mac_char_array), hash+20);
+                            if (eeprom.debug) {
+                                Serial.println("remote macHash: ");
+                                for (int i = 0; i < 20; i++) {
+                                    Serial.print(String(buff[28+i], HEX));
+                                }
+                                Serial.println("\nlocal macHash: ");
+                                for (int i = 0; i < 20; i++) {
+                                    Serial.print(String(hash[20+i], HEX));
+                                }
+                                Serial.println("");
+                                Serial.println("");
+                            }
+
                             
                             sha.reset();
                             sha.update(eeprom.imageKey, strlen(eeprom.imageKey));
@@ -892,6 +919,7 @@ void loop() {
                                 Serial.println(ESP.getCycleCount() / 80000);
                             }
                             display.init();
+                            display.firstPage();
                             if (eeprom.debug) {
                                 Serial.print("Display initialized; time in milliseconds: ");
                                 Serial.println(ESP.getCycleCount() / 80000);
@@ -903,9 +931,8 @@ void loop() {
 
                             // hash last part of first transfer (first part of image)
                             image_sha.update(buff+68, c-68);
-                        } else {
-                            // hash all of subsequent transfers (rest of image)
-                            image_sha.update(buff, c);
+                            image_bytes += c-68;
+                            skip_image_hash = true;
                         }
                         eightPixels = buff[offset];
                         if (cursor < X_RES*Y_RES) {
@@ -917,6 +944,11 @@ void loop() {
                         }
                     }
                     if(len > 0) {
+                        if (!skip_image_hash) {
+                            // hash all of subsequent transfers (rest of image)
+                            image_sha.update(buff, c);
+                            image_bytes += c;
+                        }
                         len -= c;
                     }
                 }
@@ -927,6 +959,7 @@ void loop() {
             WiFi.mode(WIFI_OFF);
             delay(10);
             if (eeprom.debug) {
+                Serial.printf ("image_bytes = %d\n", image_bytes);
                 Serial.println("Calculating SHA1 hash");
                 Serial.print("Time in milliseconds: ");
                 Serial.println(ESP.getCycleCount() / 80000);
@@ -991,6 +1024,7 @@ void loop() {
                 delay(10);
                 WiFi.mode(WIFI_OFF);
                 delay(10);
+                display.hibernate();
                 rtcData.errorCode = 3;
                 crash("Image failed verification test");
                 sleep();
@@ -1013,6 +1047,7 @@ void loop() {
                 }
             }
             display.nextPage();
+            display.hibernate();
             rtcData.errorCode = 0;
             if (eeprom.debug) {
                 Serial.println("Display updated, sleeping");
